@@ -10,6 +10,56 @@ export type StowageComment = {
   status: '待确认' | '已接受' | '已退回';
 };
 
+export type TerminalId = 'shore' | 'ship';
+
+export type ChangeKind = 'cargo' | 'lashing' | 'hazmat' | 'deckLoad';
+
+export type OfflineChange = {
+  id: string;
+  kind: ChangeKind;
+  cargoId: string;
+  bill: string;
+  at: string;
+  summary: string;
+  payload: Record<string, number | string>;
+};
+
+export type PendingBatch = {
+  id: string;
+  source: TerminalId;
+  submittedAt: string;
+  changes: OfflineChange[];
+  status: '待处理' | '已合并' | '已驳回';
+  reason: 'race-lost' | 'locked' | 'manual';
+};
+
+export type BearingOver = { id: string; allowable: number; weight: number };
+
+export type ReleaseConclusions = {
+  computedAt: string;
+  total: number;
+  longitudinal: number;
+  vertical: number;
+  deckLoad: number;
+  stability: number;
+  trim: string;
+  conflicts: { id: string; cargoId: string; level: 'high' | 'medium'; title: string; detail: string }[];
+  missingBearing: string[];
+  bearingOver: BearingOver[];
+  pass: boolean;
+};
+
+export type ReleaseState = {
+  status: '草稿' | '已放行';
+  releasedAt: string | null;
+  conclusions: ReleaseConclusions | null;
+  writeStatus: 'idle' | '写入中' | '失败' | '成功';
+  writeError: string | null;
+  retryBill: string | null;
+  localBatch: OfflineChange[];
+  attempts: number;
+};
+
 type State = {
   cargo: Cargo[];
   activeCargoId: string;
@@ -19,6 +69,13 @@ type State = {
   locked: boolean;
   viewMode: '3d' | 'section';
   draftSavedAt: string;
+  offline: boolean;
+  activeTerminal: TerminalId;
+  outbox: Record<TerminalId, OfflineChange[]>;
+  pendingBatches: PendingBatch[];
+  deckLoad: Record<string, number>;
+  changesSinceRelease: OfflineChange[];
+  release: ReleaseState;
 };
 
 const initialCargo: Cargo[] = [
@@ -30,9 +87,54 @@ const initialCargo: Cargo[] = [
   { id: 'BL-88254', bill: 'SEA-88254', type: '散货', bay: 5, row: 0, tier: 0, deck: '货舱', weight: 286.0, dimension: '散装 / 420 m³', port: '釜山', hazmat: '无', lashing: '已绑扎', color: '#9a7836' }
 ];
 
-const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('yy62-stowage-plan') : null;
-const saved = raw ? JSON.parse(raw) : null;
-const initialState: State = saved ?? {
+const now = () => new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+const uid = () => `CH-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
+
+function describeChange(kind: ChangeKind, payload: Record<string, number | string>) {
+  if (kind === 'cargo') return `货位调整 → Bay ${payload.bay} / Row ${payload.row} / Tier ${payload.tier}`;
+  if (kind === 'lashing') return `绑扎状态 → ${payload.lashing}`;
+  if (kind === 'hazmat') return `危险品 → ${payload.hazmat}`;
+  return `舱盖板承重 → ${payload.deckLoad} t/m²`;
+}
+
+// 由尺寸字符串计算占地面积（m²），尺寸为 ft 时换算为 m。
+export function footprint(item: Cargo): number {
+  const match = item.dimension.match(/([\d.]+)\s*[×xX*]\s*([\d.]+)/);
+  if (!match) return 28;
+  const a = parseFloat(match[1]);
+  const b = parseFloat(match[2]);
+  const factor = /ft/i.test(item.dimension) ? 0.3048 : 1;
+  return a * b * factor * factor;
+}
+
+export function buildConclusions(cargo: Cargo[], deckLoad: Record<string, number>): ReleaseConclusions {
+  const stability = calculateStability(cargo);
+  const conflicts = detectConflicts(cargo);
+  const missingBearing: string[] = [];
+  const bearingOver: BearingOver[] = [];
+  cargo.forEach((item) => {
+    if (item.deck !== '主甲板') return;
+    const allowable = deckLoad[item.id];
+    if (allowable == null) {
+      missingBearing.push(item.id);
+      return;
+    }
+    const area = footprint(item);
+    if (allowable * area < item.weight) {
+      bearingOver.push({ id: item.id, allowable: +(allowable * area).toFixed(1), weight: item.weight });
+    }
+  });
+  return {
+    computedAt: now(),
+    ...stability,
+    conflicts,
+    missingBearing,
+    bearingOver,
+    pass: conflicts.length === 0 && missingBearing.length === 0 && bearingOver.length === 0
+  };
+}
+
+const baseState: State = {
   cargo: initialCargo,
   activeCargoId: 'BL-88247',
   planRevision: 5,
@@ -44,23 +146,94 @@ const initialState: State = saved ?? {
   acceptedLimits: [],
   locked: false,
   viewMode: '3d',
-  draftSavedAt: '09:52'
+  draftSavedAt: '09:52',
+  offline: false,
+  activeTerminal: 'shore',
+  outbox: { shore: [], ship: [] },
+  pendingBatches: [],
+  deckLoad: {},
+  changesSinceRelease: [],
+  release: {
+    status: '草稿',
+    releasedAt: null,
+    conclusions: null,
+    writeStatus: 'idle',
+    writeError: null,
+    retryBill: null,
+    localBatch: [],
+    attempts: 0
+  }
 };
+
+const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('yy62-stowage-plan') : null;
+const saved = raw ? JSON.parse(raw) : null;
+const initialState: State = saved
+  ? {
+      ...baseState,
+      ...saved,
+      outbox: saved.outbox ?? baseState.outbox,
+      pendingBatches: saved.pendingBatches ?? [],
+      deckLoad: saved.deckLoad ?? {},
+      changesSinceRelease: saved.changesSinceRelease ?? [],
+      release: { ...baseState.release, ...(saved.release ?? {}) }
+    }
+  : baseState;
+
+// 应用一条改动到当前方案，并追加到放行批次、重算结论。
+function commitChange(state: State, change: OfflineChange) {
+  const cargo = state.cargo.find((item) => item.id === change.cargoId);
+  if (!cargo) return;
+  if (change.kind === 'cargo') Object.assign(cargo, change.payload);
+  else if (change.kind === 'lashing') cargo.lashing = change.payload.lashing as Cargo['lashing'];
+  else if (change.kind === 'hazmat') cargo.hazmat = String(change.payload.hazmat);
+  else if (change.kind === 'deckLoad') state.deckLoad[change.cargoId] = Number(change.payload.deckLoad);
+  state.changesSinceRelease.push({ ...change, id: uid(), at: now() });
+  recompute(state);
+}
+
+function recompute(state: State) {
+  state.planRevision += 1;
+  state.release.conclusions = buildConclusions(state.cargo, state.deckLoad);
+  state.draftSavedAt = now();
+}
 
 const slice = createSlice({
   name: 'stowage',
   initialState,
   reducers: {
     selectCargo(state, action: PayloadAction<string>) { state.activeCargoId = action.payload; },
+    // 在线且未锁定：直接应用货位改动；离线或已锁定：进入当前终端的待发件箱。
     moveCargo(state, action: PayloadAction<{ id: string; bay: number; row: number; tier: number }>) {
       const cargo = state.cargo.find((item) => item.id === action.payload.id);
-      if (cargo) Object.assign(cargo, action.payload);
-      state.planRevision += 1;
-      state.draftSavedAt = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+      if (!cargo) return;
+      if (state.offline || state.locked) {
+        state.outbox[state.activeTerminal].push({
+          id: uid(), kind: 'cargo', cargoId: cargo.id, bill: cargo.bill, at: now(),
+          summary: describeChange('cargo', action.payload), payload: { ...action.payload }
+        });
+        state.draftSavedAt = now();
+      } else {
+        commitChange(state, {
+          id: uid(), kind: 'cargo', cargoId: cargo.id, bill: cargo.bill, at: now(),
+          summary: describeChange('cargo', action.payload), payload: { ...action.payload }
+        });
+      }
     },
     updateLashing(state, action: PayloadAction<{ id: string; lashing: Cargo['lashing'] }>) {
       const cargo = state.cargo.find((item) => item.id === action.payload.id);
-      if (cargo) cargo.lashing = action.payload.lashing;
+      if (!cargo) return;
+      if (state.offline || state.locked) {
+        state.outbox[state.activeTerminal].push({
+          id: uid(), kind: 'lashing', cargoId: cargo.id, bill: cargo.bill, at: now(),
+          summary: describeChange('lashing', { lashing: action.payload.lashing }), payload: { lashing: action.payload.lashing }
+        });
+        state.draftSavedAt = now();
+      } else {
+        commitChange(state, {
+          id: uid(), kind: 'lashing', cargoId: cargo.id, bill: cargo.bill, at: now(),
+          summary: describeChange('lashing', { lashing: action.payload.lashing }), payload: { lashing: action.payload.lashing }
+        });
+      }
     },
     addComment(state, action: PayloadAction<{ cargoId: string; author: string; role: StowageComment['role']; content: string }>) {
       state.comments.unshift({ ...action.payload, id: `CM-${Date.now()}`, status: '待确认' });
@@ -77,11 +250,137 @@ const slice = createSlice({
       if (!state.acceptedLimits.includes(action.payload)) state.acceptedLimits.push(action.payload);
     },
     setViewMode(state, action: PayloadAction<'3d' | 'section'>) { state.viewMode = action.payload; },
-    lockPlan(state) { state.locked = true; state.planRevision += 1; }
+    lockPlan(state) {
+      state.locked = true;
+      state.planRevision += 1;
+      state.release.status = '草稿';
+    },
+    setOffline(state, action: PayloadAction<boolean>) { state.offline = action.payload; },
+    setTerminal(state, action: PayloadAction<TerminalId>) { state.activeTerminal = action.payload; },
+    // 离线模式下暂存一版改动（货位 / 绑扎 / 危险品 / 承重），不触碰当前方案。
+    stageChange(state, action: PayloadAction<{ kind: ChangeKind; cargoId: string; payload: Record<string, number | string> }>) {
+      const cargo = state.cargo.find((item) => item.id === action.payload.cargoId);
+      if (!cargo) return;
+      state.outbox[state.activeTerminal].push({
+        id: uid(),
+        kind: action.payload.kind,
+        cargoId: cargo.id,
+        bill: cargo.bill,
+        at: now(),
+        summary: describeChange(action.payload.kind, action.payload.payload),
+        payload: action.payload.payload
+      });
+      state.draftSavedAt = now();
+    },
+    // 单个终端回网提交：方案未锁定则合并，已锁定则整批进入待处理，不覆盖锁定快照。
+    submitBatch(state, action: PayloadAction<{ source: TerminalId }>) {
+      const changes = state.outbox[action.payload.source];
+      if (!changes.length) return;
+      const batch: PendingBatch = {
+        id: `B-${Date.now()}`,
+        source: action.payload.source,
+        submittedAt: now(),
+        changes: changes.map((change) => ({ ...change })),
+        status: '待处理',
+        reason: state.locked ? 'locked' : 'manual'
+      };
+      state.outbox[action.payload.source] = [];
+      if (state.locked) {
+        state.pendingBatches.unshift(batch);
+        return;
+      }
+      batch.changes.forEach((change) => commitChange(state, change));
+      batch.status = '已合并';
+      state.pendingBatches.unshift(batch);
+    },
+    // 两个终端同时提交：先确认的一版合并保留，另一版进入待处理（竞态落败）。
+    raceSubmit(state) {
+      const sources: TerminalId[] = ['shore', 'ship'];
+      let merged = false;
+      if (state.locked) {
+        sources.forEach((source) => {
+          const changes = state.outbox[source];
+          if (!changes.length) return;
+          state.pendingBatches.unshift({
+            id: uid(), source, submittedAt: now(),
+            changes: changes.map((change) => ({ ...change })),
+            status: '待处理', reason: 'locked'
+          });
+          state.outbox[source] = [];
+        });
+        return;
+      }
+      sources.forEach((source) => {
+        const changes = state.outbox[source];
+        if (!changes.length) return;
+        const batch: PendingBatch = {
+          id: uid(), source, submittedAt: now(),
+          changes: changes.map((change) => ({ ...change })),
+          status: '待处理', reason: 'race-lost'
+        };
+        state.outbox[source] = [];
+        if (!merged) {
+          batch.changes.forEach((change) => commitChange(state, change));
+          batch.status = '已合并';
+          batch.reason = 'manual';
+          merged = true;
+        }
+        state.pendingBatches.unshift(batch);
+      });
+    },
+    // 手动合并一个待处理批次；方案已锁定时不允许覆盖快照。
+    mergeBatch(state, action: PayloadAction<string>) {
+      const batch = state.pendingBatches.find((item) => item.id === action.payload);
+      if (!batch || batch.status !== '待处理' || state.locked) return;
+      batch.changes.forEach((change) => commitChange(state, change));
+      batch.status = '已合并';
+      batch.reason = 'manual';
+    },
+    rejectBatch(state, action: PayloadAction<string>) {
+      const batch = state.pendingBatches.find((item) => item.id === action.payload);
+      if (batch && batch.status === '待处理') batch.status = '已驳回';
+    },
+    // 补齐旧草稿缺失的舱盖板承重记录；承重补齐后重算结论才能重排。
+    fillDeckLoad(state, action: PayloadAction<{ cargoId: string; value: number }>) {
+      commitChange(state, {
+        id: uid(), kind: 'deckLoad', cargoId: action.payload.cargoId, bill: state.cargo.find((item) => item.id === action.payload.cargoId)?.bill ?? '',
+        at: now(), summary: describeChange('deckLoad', { deckLoad: action.payload.value }), payload: { deckLoad: action.payload.value }
+      });
+    },
+    recalcRelease(state) {
+      recompute(state);
+    },
+    releaseSucceeded(state, action: PayloadAction<{ revision: number }>) {
+      state.release.status = '已放行';
+      state.release.releasedAt = now();
+      state.release.writeStatus = '成功';
+      state.release.writeError = null;
+      state.release.localBatch = [];
+      state.release.retryBill = null;
+      state.changesSinceRelease = [];
+      state.locked = true;
+      state.planRevision = action.payload.revision;
+    },
+    // 放行写入失败：保留本地批次，记录原提单号与失败次数，批次退回终端待发件箱。
+    releaseFailed(state, action: PayloadAction<{ error: string; retryBill: string; source: TerminalId }>) {
+      state.release.status = '草稿';
+      state.release.writeStatus = '失败';
+      state.release.writeError = action.payload.error;
+      state.release.retryBill = action.payload.retryBill;
+      state.release.localBatch = state.changesSinceRelease.map((change) => ({ ...change }));
+      state.release.attempts += 1;
+      state.outbox[action.payload.source] = state.changesSinceRelease.map((change) => ({ ...change }));
+      state.changesSinceRelease = [];
+    }
   }
 });
 
-export const { selectCargo, moveCargo, updateLashing, addComment, acceptComment, rejectComment, acceptLimit, setViewMode, lockPlan } = slice.actions;
+export const {
+  selectCargo, moveCargo, updateLashing,
+  addComment, acceptComment, rejectComment, acceptLimit, setViewMode, lockPlan,
+  setOffline, setTerminal, stageChange, submitBatch, raceSubmit, mergeBatch, rejectBatch,
+  fillDeckLoad, recalcRelease, releaseSucceeded, releaseFailed
+} = slice.actions;
 
 export const store = configureStore({
   reducer: { stowage: slice.reducer, [stowageApi.reducerPath]: stowageApi.reducer },

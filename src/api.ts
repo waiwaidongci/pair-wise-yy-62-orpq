@@ -18,6 +18,9 @@ export type Cargo = {
   color: string;
 };
 
+export type ReleaseWriteResult = { ok: true; revision: number };
+export type ReleaseWriteArg = { bill: string; forceFail?: boolean };
+
 const voyageData = {
   id: 'V-2609-17',
   vessel: '海岳轮',
@@ -41,13 +44,26 @@ const mockBaseQuery: BaseQueryFn = async (arg) => {
   return { error: { status: 404, data: 'Not found' } };
 };
 
+// 模拟开航放行写入：约 35% 概率失败，用于验证“保留本地批次、从原提单号重试”。
+const releaseWrite = async (arg: ReleaseWriteArg): Promise<{ data: ReleaseWriteResult } | { error: { status: number; data: { status: string; bill: string; message: string } } }> => {
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  if (arg.forceFail || Math.random() < 0.35) {
+    return { error: { status: 500, data: { status: 'write_failed', bill: arg.bill, message: '放行写入失败：岸基系统未确认该批次' } } };
+  }
+  return { data: { ok: true, revision: voyageData.revision + 1 } };
+};
+
 export const stowageApi = createApi({
   reducerPath: 'stowageApi',
   baseQuery: mockBaseQuery,
-  tagTypes: ['Voyage'],
+  tagTypes: ['Voyage', 'Release'],
   endpoints: (builder) => ({
-    getVoyage: builder.query<typeof voyageData, void>({ query: () => 'voyage', providesTags: ['Voyage'] })
+    getVoyage: builder.query<typeof voyageData, void>({ query: () => 'voyage', providesTags: ['Voyage'] }),
+    writeRelease: builder.mutation<ReleaseWriteResult, ReleaseWriteArg>({
+      queryFn: (arg) => releaseWrite(arg),
+      invalidatesTags: ['Release']
+    })
   })
 });
 
-export const { useGetVoyageQuery } = stowageApi;
+export const { useGetVoyageQuery, useWriteReleaseMutation } = stowageApi;

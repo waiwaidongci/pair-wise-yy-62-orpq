@@ -29,6 +29,7 @@ body { margin: 0; min-width: 320px; background: #eef2f0; }
 .warning-banner { display: flex; align-items: center; gap: 9px; color: #8e5617; background: #fff7e7; border: 1px solid #ebcf9f; border-radius: 6px; padding: 11px 13px; margin-bottom: 14px; font-size: 12px; }
 .warning-banner span { color: #876f52; }
 .overview-grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 14px; align-items: start; }
+.release-grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 14px; align-items: start; }
 .scene-card { overflow: hidden; border: 1px solid var(--line); box-shadow: none !important; }
 .panel-title { min-height: 57px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--line); }
 .panel-title strong { display: block; font-size: 13px; }

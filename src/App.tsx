@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
-import { BrowserRouter, NavLink, Navigate, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, Link, NavLink, Navigate, Route, Routes } from 'react-router-dom';
 import {
   ActionIcon,
+  Alert,
   AppShell,
   AppShellHeader,
   AppShellMain,
@@ -18,9 +19,11 @@ import {
   NumberInput,
   Progress,
   ScrollArea,
+  SegmentedControl,
   Select,
   SimpleGrid,
   Stack,
+  Switch,
   Table,
   Tabs,
   Text,
@@ -30,10 +33,16 @@ import {
   Tooltip
 } from '@mantine/core';
 import {
+  IconAlertCircle,
   IconAlertTriangle,
   IconAnchor,
   IconBoxMultiple,
+  IconBuilding,
   IconCheck,
+  IconCircleCheck,
+  IconClipboardCheck,
+  IconCloudOff,
+  IconCloudUp,
   IconCube,
   IconFileDescription,
   IconHistory,
@@ -43,33 +52,47 @@ import {
   IconPlayerPlay,
   IconPrinter,
   IconRefresh,
+  IconRotateClockwise,
   IconRulerMeasure,
   IconRoute,
   IconShip,
   IconUsers
 } from '@tabler/icons-react';
 import * as THREE from 'three';
-import { useGetVoyageQuery, type Cargo, type CargoType } from './api';
+import { useGetVoyageQuery, useWriteReleaseMutation, type Cargo, type CargoType } from './api';
 import {
   acceptComment,
   acceptLimit,
   addComment,
   calculateStability,
   detectConflicts,
+  fillDeckLoad,
+  footprint,
   lockPlan,
+  mergeBatch,
   moveCargo,
+  raceSubmit,
+  recalcRelease,
+  rejectBatch,
   rejectComment,
+  releaseFailed,
+  releaseSucceeded,
   selectCargo,
+  setOffline,
+  setTerminal,
   setViewMode,
-  store,
+  submitBatch,
   updateLashing,
-  type RootState
+  type ChangeKind,
+  type RootState,
+  type TerminalId
 } from './store';
 
 const nav = [
   { path: '/', label: '航次总览', icon: <IconShip size={17} /> },
   { path: '/stowage', label: '配载与货位', icon: <IconLayoutBoardSplit size={17} /> },
   { path: '/compare', label: '方案对比', icon: <IconHistory size={17} /> },
+  { path: '/release', label: '开航放行', icon: <IconClipboardCheck size={17} /> },
   { path: '/print', label: '配载图与清单', icon: <IconPrinter size={17} /> }
 ];
 
@@ -227,6 +250,7 @@ function Overview() {
   return <div className="page">
     <PageHeading eyebrow={`${data?.id ?? 'V-2609-17'} / 航次审阅`} title="多用途船舶配载校核" description={`${data?.vessel ?? '海岳轮'} · ${data?.route ?? '上海 → 釜山 → 温哥华'} · 计划离港 ${data?.departure ?? '10-02 14:00'}`} actions={<><Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>{state.viewMode === '3d' ? '二维剖面' : '三维视角'}</Button><Button color="teal" leftSection={<IconLock size={16} />} disabled={conflicts.length > 0 || state.locked} onClick={() => dispatch(lockPlan())}>{state.locked ? '方案已锁定' : '锁定配载版本'}</Button></>} />
     {conflicts.length > 0 && <div className="warning-banner"><IconAlertTriangle size={18} /><strong>{conflicts.length} 项配载冲突待处理</strong><span>{conflicts.map((item) => item.title).join('、')}</span></div>}
+    {state.pendingBatches.filter((batch) => batch.status === '待处理').length > 0 && <div className="warning-banner"><IconCloudUp size={18} /><strong>{state.pendingBatches.filter((batch) => batch.status === '待处理').length} 项终端改动待处理</strong><span>岸基配载员与船上大副的离线改动尚未合并，放行结论未含最新货位与承重。</span><Button component={Link} to="/release" size="compact-xs" variant="default">前往开航放行</Button></div>}
     <SimpleGrid cols={{ base: 2, lg: 4 }} spacing="sm" mb="md">{[
       ['总货重', `${stability.total.toFixed(1)} t`, '设计上限 3560 t', 'ok'],
       ['稳性裕度', `${stability.stability.toFixed(1)}%`, stability.stability > 70 ? '符合航次要求' : '低于控制线', stability.stability > 70 ? 'ok' : 'bad'],
@@ -258,7 +282,7 @@ function Stowage() {
   useEffect(() => { setBay(active.bay); setRow(active.row); setTier(active.tier); }, [active.bay, active.row, active.tier]);
   const slots = useMemo(() => Array.from({ length: 28 }).map((_, index) => ({ id: `slot-${index}`, bay: 4 + Math.floor(index / 4), row: index % 4, tier: 0, label: `B${4 + Math.floor(index / 4)} R${index % 4}` })), []);
   return <div className="page">
-    <PageHeading eyebrow={`配载工作区 / 方案 V${state.planRevision}`} title="货位安排与冲突校核" description="拖动货箱排序，或输入目标货位精确调整；系统即时重算重量分布。" actions={<Badge size="lg" color={conflicts.length ? 'orange' : 'teal'} leftSection={<IconCheck size={14} />}>{conflicts.length ? `${conflicts.length} 项冲突` : '校验通过'}</Badge>} />
+    <PageHeading eyebrow={`配载工作区 / 方案 V${state.planRevision}`} title="货位安排与冲突校核" description="拖动货箱排序，或输入目标货位精确调整；系统即时重算重量分布。" actions={<Group gap="xs">{state.offline && <Badge size="lg" color="blue" leftSection={<IconCloudOff size={14} />}>离线中 · 改动进入{state.activeTerminal === 'shore' ? '岸基' : '大副'}待发件箱</Badge>}{state.locked && <Badge size="lg" color="gray" leftSection={<IconLock size={14} />}>快照已锁定 · 改动进入待处理</Badge>}<Badge size="lg" color={conflicts.length ? 'orange' : 'teal'} leftSection={<IconCheck size={14} />}>{conflicts.length ? `${conflicts.length} 项冲突` : '校验通过'}</Badge></Group>} />
     <div className="stowage-grid">
       <Card padding={0} className="cargo-list-panel"><div className="panel-title"><div><strong>货物清单</strong><Text size="xs" c="dimmed">{state.cargo.length} 票 · 可拖拽</Text></div><TextInput size="xs" placeholder="搜索提单号" /></div><ScrollArea h={600}><div className="cargo-list">{state.cargo.map((item) => <button draggable onDragStart={() => setDragId(item.id)} key={item.id} className={state.activeCargoId === item.id ? 'active' : ''} onClick={() => dispatch(selectCargo(item.id))}><i style={{ background: item.color }} /><div><strong>{item.bill}</strong><span>{item.type} · {item.weight}t · {item.port}</span></div><Badge size="xs" color={item.hazmat === '无' ? 'gray' : 'orange'}>{item.hazmat === '无' ? `B${item.bay}` : 'DG'}</Badge></button>)}</div></ScrollArea></Card>
       <Card padding={0} className="deck-panel"><div className="panel-title"><div><strong>主甲板货位图</strong><Text size="xs" c="dimmed">将货物拖入槽位，或点击槽位选择</Text></div><Group gap="xs"><Badge color="teal">稳性 {stability.stability.toFixed(1)}%</Badge><Badge color="gray">{stability.trim}</Badge></Group></div><div className="deck-layout"><div className="bridge-shape">驾驶台</div><div className="slot-grid">{slots.map((slot) => { const occupied = state.cargo.find((item) => item.deck === '主甲板' && item.bay === slot.bay && item.row === slot.row); return <button key={slot.id} onDragOver={(event) => event.preventDefault()} onDrop={() => { if (dragId) dispatch(moveCargo({ id: dragId, bay: slot.bay, row: slot.row, tier: occupied?.tier ?? 1 })); setDragId(null); }} className={occupied ? 'occupied' : ''} style={occupied ? { background: occupied.color } : undefined} onClick={() => { if (occupied) { dispatch(selectCargo(occupied.id)); setRow(slot.row); setBay(slot.bay); } }}><small>{slot.label}</small>{occupied && <strong>{occupied.bill.slice(-3)}<span>{occupied.weight}t</span></strong>}</button>; })}</div><div className="deck-axis">左舷 ← 横向 Row → 右舷</div></div></Card>
@@ -290,6 +314,143 @@ function Compare() {
   </div>;
 }
 
+const TERMINAL_META: Record<TerminalId, { label: string; icon: ReactNode; desc: string; color: string }> = {
+  shore: { label: '岸基配载员', icon: <IconBuilding size={15} />, desc: '岸基配载中心', color: 'blue' },
+  ship: { label: '船上大副', icon: <IconShip size={15} />, desc: '船舶驾驶台', color: 'teal' }
+};
+
+function changeKindLabel(kind: ChangeKind) {
+  if (kind === 'cargo') return '货位';
+  if (kind === 'lashing') return '绑扎';
+  if (kind === 'hazmat') return '危险品';
+  return '承重';
+}
+
+function Release() {
+  const state = useSelector((root: RootState) => root.stowage);
+  const dispatch = useDispatch();
+  const [forceFail, setForceFail] = useState(false);
+  const [writeRelease, { isLoading: writing }] = useWriteReleaseMutation();
+  const conclusions = state.release.conclusions;
+  useEffect(() => { if (!conclusions) dispatch(recalcRelease()); }, [conclusions, dispatch]);
+
+  const handleFill = (cargoId: string, raw: string) => {
+    const value = Number(raw);
+    if (Number.isFinite(value) && value > 0) dispatch(fillDeckLoad({ cargoId, value }));
+  };
+
+  const attemptWrite = async () => {
+    if (!conclusions?.pass || writing) return;
+    const bill = state.release.retryBill ?? state.changesSinceRelease[0]?.bill ?? state.cargo[0]?.bill ?? 'SEA-88214';
+    const res = await writeRelease({ bill, forceFail });
+    if ('error' in res) {
+      const err = res.error as { data?: { message?: string } };
+      dispatch(releaseFailed({ error: err?.data?.message ?? '放行写入失败：本地批次未被岸基系统确认', retryBill: bill, source: state.activeTerminal }));
+    } else {
+      dispatch(releaseSucceeded({ revision: res.data.revision }));
+    }
+  };
+
+  const pendingCount = state.pendingBatches.filter((batch) => batch.status === '待处理').length;
+
+  return <div className="page">
+    <PageHeading eyebrow="RELEASE / 开航放行" title="配载开航放行" description="货物、货位、危险品隔离、绑扎点与舱盖板承重校核通过后写入放行；断网改动回网合并，竞态先确认者保留。" actions={<Group gap="xs"><Switch checked={state.offline} onChange={(event) => dispatch(setOffline(event.currentTarget.checked))} label={state.offline ? '离线模式' : '在线模式'} /><SegmentedControl value={state.activeTerminal} onChange={(value) => dispatch(setTerminal(value as TerminalId))} data={[{ value: 'shore', label: '岸基配载员' }, { value: 'ship', label: '船上大副' }]} /></Group>} />
+    {state.offline && <div className="warning-banner"><IconCloudOff size={18} /><strong>离线模式</strong><span>两个终端的改动保存在本地待发件箱，回网后提交合并；同时提交时先确认的一版保留，另一版进入待处理，不覆盖已锁定快照。</span></div>}
+    <div className="release-grid">
+      <Stack gap="sm">
+        <Card padding="md"><div className="panel-title"><div><strong>终端改动与回网提交</strong><Text size="xs" c="dimmed">断网期间改动进入待发件箱，回网后合并入方案</Text></div><IconCloudUp size={18} /></div>
+          <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm" mt="sm">
+            {(['shore', 'ship'] as TerminalId[]).map((source) => {
+              const box = state.outbox[source];
+              const meta = TERMINAL_META[source];
+              return <Card key={source} withBorder padding="sm" radius="md">
+                <Group justify="space-between"><Group gap="xs"><ThemeIcon variant="light" color={meta.color}>{meta.icon}</ThemeIcon><div><Text size="xs" fw={700}>{meta.label}</Text><Text size="xs" c="dimmed">{meta.desc}</Text></div></Group><Badge size="xs" color={box.length ? 'orange' : 'gray'}>{box.length} 项待发</Badge></Group>
+                <Stack gap={3} mt="xs">{box.length === 0 && <Text size="xs" c="dimmed">无待发改动</Text>}{box.map((change) => <Group key={change.id} gap={6}><Badge size="xs" variant="light">{changeKindLabel(change.kind)}</Badge><Text size="xs">{change.bill} · {change.summary}</Text></Group>)}</Stack>
+                <Button fullWidth size="xs" mt="sm" disabled={box.length === 0 || writing} onClick={() => dispatch(submitBatch({ source }))}>提交回网</Button>
+              </Card>;
+            })}
+          </SimpleGrid>
+          <Button variant="default" size="xs" mt="sm" leftSection={<IconRefresh size={14} />} onClick={() => dispatch(raceSubmit())} disabled={writing}>两终端同时提交（模拟竞态）</Button>
+        </Card>
+
+        <Card padding="md"><div className="panel-title"><div><strong>待处理批次</strong><Text size="xs" c="dimmed">竞态落败或锁定期间提交的批次，不覆盖已锁定快照</Text></div><Badge>{pendingCount} 项待处理</Badge></div>
+          <Stack gap="xs" mt="sm">{state.pendingBatches.length === 0 && <Text size="xs" c="dimmed">暂无批次记录。</Text>}
+            {state.pendingBatches.map((batch) => <Card key={batch.id} withBorder padding="sm" radius="md" className={batch.status === '待处理' ? 'conflict-card' : ''}>
+              <Group justify="space-between"><Group gap="xs">
+                <Badge size="xs" color={batch.source === 'shore' ? 'blue' : 'teal'}>{TERMINAL_META[batch.source].label}</Badge>
+                <Text size="xs" fw={700}>{batch.submittedAt}</Text>
+                <Badge size="xs" color={batch.status === '待处理' ? 'orange' : batch.status === '已合并' ? 'teal' : 'gray'}>{batch.status}</Badge>
+                {batch.status === '待处理' && <Text size="xs" c="dimmed">{batch.reason === 'race-lost' ? '竞态落败' : '方案已锁定'}</Text>}
+              </Group>
+              {batch.status === '待处理' && <Group gap={4}><Button size="compact-xs" color="teal" disabled={state.locked} onClick={() => dispatch(mergeBatch(batch.id))}>合并入方案</Button><Button size="compact-xs" variant="default" onClick={() => dispatch(rejectBatch(batch.id))}>驳回</Button></Group>}
+              </Group>
+              <Stack gap={2} mt={6}>{batch.changes.map((change) => <Text key={change.id} size="xs" c="dimmed">{change.bill} · {changeKindLabel(change.kind)} · {change.summary}</Text>)}</Stack>
+            </Card>)}
+          </Stack>
+        </Card>
+
+        <Card padding="md"><div className="panel-title"><div><strong>舱盖板承重记录</strong><Text size="xs" c="dimmed">旧草稿补齐承重记录后才能重排；承重不足不得放行</Text></div><IconRulerMeasure size={18} /></div>
+          <Table verticalSpacing="xs" mt="sm"><Table.Thead><Table.Tr><Table.Th>提单号</Table.Th><Table.Th>货位</Table.Th><Table.Th>重量</Table.Th><Table.Th>占地</Table.Th><Table.Th>允许承重</Table.Th><Table.Th>状态</Table.Th></Table.Tr></Table.Thead><Table.Tbody>
+            {state.cargo.filter((item) => item.deck === '主甲板').map((item) => {
+              const area = footprint(item);
+              const value = state.deckLoad[item.id];
+              const over = value != null && value * area < item.weight;
+              return <Table.Tr key={item.id}><Table.Td><Text size="xs" fw={700}>{item.bill}</Text></Table.Td><Table.Td><Text size="xs">B{item.bay}/R{item.row}/T{item.tier}</Text></Table.Td><Table.Td><Text size="xs">{item.weight} t</Text></Table.Td><Table.Td><Text size="xs">{area.toFixed(1)} m²</Text></Table.Td><Table.Td>{value == null
+                ? <NumberInput size="xs" w={120} suffix=" t/m²" min={0} placeholder="补齐记录" onBlur={(event) => handleFill(item.id, event.currentTarget.value)} />
+                : <Text size="xs">{value} t/m²</Text>}</Table.Td><Table.Td>{value == null ? <Badge size="xs" color="orange">缺记录</Badge> : over ? <Badge size="xs" color="red">不足</Badge> : <Badge size="xs" color="teal">正常</Badge>}</Table.Td></Table.Tr>;
+            })}
+          </Table.Tbody></Table>
+        </Card>
+
+        <Card padding="md"><div className="panel-title"><div><strong>稳性与放行结论</strong><Text size="xs" c="dimmed">隔离、绑扎或承重改动后立即重算</Text></div><Group gap="xs"><Badge size="xs" color={conclusions?.pass ? 'teal' : 'red'}>{conclusions?.pass ? '通过' : '未通过'}</Badge><Button size="compact-xs" variant="default" leftSection={<IconRefresh size={12} />} onClick={() => dispatch(recalcRelease())}>重算</Button></Group></div>
+          {conclusions && <>
+            <SimpleGrid cols={{ base: 2, sm: 4 }} spacing="xs" mt="sm">
+              <div className="mini-stat"><span>总货重</span><strong>{conclusions.total.toFixed(1)} t</strong></div>
+              <div className="mini-stat"><span>稳性裕度</span><strong>{conclusions.stability.toFixed(1)}%</strong></div>
+              <div className="mini-stat"><span>纵倾</span><strong>{conclusions.trim}</strong></div>
+              <div className="mini-stat"><span>主甲板载荷</span><strong>{conclusions.deckLoad.toFixed(1)} t</strong></div>
+            </SimpleGrid>
+            {(conclusions.conflicts.length > 0 || conclusions.missingBearing.length > 0 || conclusions.bearingOver.length > 0) && <Stack gap={4} mt="sm">
+              {conclusions.conflicts.map((item) => <Text key={item.id} size="xs" c="red">· {item.title}：{item.detail}</Text>)}
+              {conclusions.missingBearing.map((id) => <Text key={id} size="xs" c="orange">· {id} 缺少舱盖板承重记录，补齐后才能重排</Text>)}
+              {conclusions.bearingOver.map((item) => <Text key={item.id} size="xs" c="red">· {item.id} 承重不足：允许 {item.allowable} t ＜ 货重 {item.weight} t</Text>)}
+            </Stack>}
+            <Text size="xs" c="dimmed" mt="xs">重算于 {conclusions.computedAt}</Text>
+          </>}
+        </Card>
+      </Stack>
+
+      <Stack gap="sm">
+        <Card padding="md"><div className="panel-title"><div><strong>开航放行</strong><Text size="xs" c="dimmed">写入岸基放行系统</Text></div><Badge color={state.release.status === '已放行' ? 'teal' : 'orange'}>{state.release.status}</Badge></div>
+          <Stack gap="xs" mt="sm">
+            <Group justify="space-between"><Text size="xs" c="dimmed">结论状态</Text><Badge size="xs" color={conclusions?.pass ? 'teal' : 'red'}>{conclusions?.pass ? '具备放行条件' : '未具备放行条件'}</Badge></Group>
+            <Group justify="space-between"><Text size="xs" c="dimmed">已合并改动</Text><Text size="xs" fw={700}>{state.changesSinceRelease.length} 项</Text></Group>
+            <Group justify="space-between"><Text size="xs" c="dimmed">失败重试</Text><Text size="xs" fw={700}>{state.release.attempts} 次</Text></Group>
+            {state.release.writeStatus === '失败' && <Alert color="red" icon={<IconAlertCircle size={15} />} title="放行写入失败"><Text size="xs">{state.release.writeError}</Text><Text size="xs" mt={4}>本地批次已保留（{state.release.localBatch.length} 项），将从原提单号 {state.release.retryBill} 重试。</Text></Alert>}
+            {state.release.writeStatus === '成功' && <Alert color="teal" icon={<IconCircleCheck size={15} />} title="放行写入成功"><Text size="xs">方案已锁定为放行版本，未核结果不再停留在草稿。</Text></Alert>}
+            <Checkbox checked={forceFail} onChange={(event) => setForceFail(event.currentTarget.checked)} label="模拟岸基系统写入失败" />
+            {state.release.status === '已放行'
+              ? <Button fullWidth color="teal" leftSection={<IconLock size={16} />} disabled>已放行 · 快照锁定</Button>
+              : state.release.writeStatus === '失败'
+                ? <Button fullWidth color="teal" leftSection={<IconRotateClockwise size={16} />} loading={writing} onClick={attemptWrite}>从 {state.release.retryBill} 重试放行</Button>
+                : <Button fullWidth color="teal" leftSection={<IconPlayerPlay size={16} />} loading={writing} disabled={!conclusions?.pass} onClick={attemptWrite}>写入开航放行</Button>}
+            {!conclusions?.pass && state.release.status !== '已放行' && <Text size="xs" c="orange">存在未消除的冲突或缺失的承重记录，放行按钮不可用。</Text>}
+          </Stack>
+        </Card>
+        <Card padding="md"><div className="panel-title"><div><strong>放行规则</strong></div><IconAnchor size={18} /></div>
+          <Stack gap={6} mt="sm">
+            <Text size="xs" c="dimmed">· 两个终端同时提交时，先确认的一版保留，另一版进入待处理。</Text>
+            <Text size="xs" c="dimmed">· 方案锁定后任何提交都进入待处理，不覆盖已锁定快照。</Text>
+            <Text size="xs" c="dimmed">· 隔离、绑扎或承重任一改动后，稳性与放行结论立即重算。</Text>
+            <Text size="xs" c="dimmed">· 旧草稿缺少承重记录时，补齐后才能重排放行。</Text>
+            <Text size="xs" c="dimmed">· 放行写入失败后保留本地批次，从原提单号重试。</Text>
+          </Stack>
+        </Card>
+      </Stack>
+    </div>
+  </div>;
+}
+
 function PrintPlan() {
   const { data } = useGetVoyageQuery();
   const state = useSelector((root: RootState) => root.stowage);
@@ -298,8 +459,15 @@ function PrintPlan() {
   return <div className="page print-page">
     <PageHeading eyebrow="STOWAGE PLAN / PRINT" title="配载图与卸货清单" description="面向船长、码头和理货人员打印，包含重量分布和危险品标记。" actions={<><Button variant="default" leftSection={<IconPlayerPlay size={16} />} onClick={() => dispatch(setViewMode(state.viewMode === '3d' ? 'section' : '3d'))}>预览剖面</Button><Button color="teal" leftSection={<IconPrinter size={16} />} onClick={() => window.print()}>打印配载包</Button></>} />
     <Card padding="xl" className="print-sheet">
-      <div className="print-header"><div><Text size="xs" c="dimmed">VESSEL STOWAGE PLAN</Text><h1>{data?.vessel ?? '海岳轮'} · {data?.id ?? 'V-2609-17'}</h1><p>{data?.route}</p></div><div className="print-stamp">方案 V{state.planRevision}<br />已校核</div></div>
+      <div className="print-header"><div><Text size="xs" c="dimmed">VESSEL STOWAGE PLAN</Text><h1>{data?.vessel ?? '海岳轮'} · {data?.id ?? 'V-2609-17'}</h1><p>{data?.route}</p></div><div className="print-stamp" style={state.release.status !== '已放行' ? { borderColor: '#aa671e', color: '#aa671e' } : undefined}>{state.release.status === '已放行' ? <>方案 V{state.planRevision}<br />已放行</> : <>草稿<br />未放行</>}</div></div>
+      {state.release.status !== '已放行' && <div className="warning-banner" style={{ margin: '12px 0 0' }}><IconAlertTriangle size={16} /><strong>未核结果停留在草稿</strong><span>本页为草稿配载图，放行结论尚未写入；待处理项未合并前不得作为正式放行依据。</span></div>}
       <div className="print-kpis"><div><span>总货重</span><strong>{stability.total.toFixed(1)} t</strong></div><div><span>稳性裕度</span><strong>{stability.stability.toFixed(1)}%</strong></div><div><span>纵倾</span><strong>{stability.trim}</strong></div><div><span>主甲板载荷</span><strong>{stability.deckLoad.toFixed(1)} t</strong></div></div>
+      <h3>待处理项与来源</h3>
+      {state.pendingBatches.filter((batch) => batch.status === '待处理').length === 0
+        ? <Text size="xs" c="dimmed">无待处理项，所有终端改动均已合并入当前方案。</Text>
+        : <Table striped><Table.Thead><Table.Tr><Table.Th>来源终端</Table.Th><Table.Th>提交时间</Table.Th><Table.Th>状态</Table.Th><Table.Th>改动内容</Table.Th></Table.Tr></Table.Thead><Table.Tbody>
+          {state.pendingBatches.filter((batch) => batch.status === '待处理').map((batch) => <Table.Tr key={batch.id}><Table.Td><Badge size="xs" color={batch.source === 'shore' ? 'blue' : 'teal'}>{batch.source === 'shore' ? '岸基配载员' : '船上大副'}</Badge></Table.Td><Table.Td><Text size="xs">{batch.submittedAt}</Text></Table.Td><Table.Td><Badge size="xs" color="orange">待处理</Badge></Table.Td><Table.Td><Stack gap={2}>{batch.changes.map((change) => <Text key={change.id} size="xs">{change.bill} · {changeKindLabel(change.kind)} · {change.summary}</Text>)}</Stack></Table.Td></Table.Tr>)}
+        </Table.Tbody></Table>}
       <h3>主甲板配载图</h3>
       <div className="print-deck">{Array.from({ length: 28 }).map((_, index) => { const row = index % 4; const bay = 4 + Math.floor(index / 4); const item = state.cargo.find((cargo) => cargo.deck === '主甲板' && cargo.bay === bay && cargo.row === row); return <div key={index} className={item ? 'filled' : ''} style={item ? { borderTopColor: item.color } : undefined}><span>{item ? item.bill.slice(-3) : ''}</span><small>{item ? `${item.weight}t` : `B${bay}/R${row}`}</small>{item?.hazmat !== '无' && item && <b>DG</b>}</div>; })}</div>
       <h3>卸货顺序与绑扎清单</h3>
@@ -320,5 +488,5 @@ function Shell({ children }: { children: ReactNode }) {
 }
 
 export default function App() {
-  return <BrowserRouter><Shell><Routes><Route path="/" element={<Overview />} /><Route path="/stowage" element={<Stowage />} /><Route path="/compare" element={<Compare />} /><Route path="/print" element={<PrintPlan />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></Shell></BrowserRouter>;
+  return <BrowserRouter><Shell><Routes><Route path="/" element={<Overview />} /><Route path="/stowage" element={<Stowage />} /><Route path="/compare" element={<Compare />} /><Route path="/release" element={<Release />} /><Route path="/print" element={<PrintPlan />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></Shell></BrowserRouter>;
 }
