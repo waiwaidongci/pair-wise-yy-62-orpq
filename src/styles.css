@@ -132,6 +132,32 @@ body { margin: 0; min-width: 320px; background: #eef2f0; }
   .print-deck, .mini-deck { grid-template-columns: repeat(4, 1fr); }
 }
 
+/* 开航放行工作流 */
+.terminal-banner { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 9px 13px; border-radius: 6px; margin-bottom: 14px; font-size: 12px; border: 1px solid; }
+.terminal-banner.online { background: #edf7f3; border-color: #b7dccf; color: #1d5f51; }
+.terminal-banner.offline { background: #fdeeee; border-color: #e6b5b3; color: #8f3531; }
+.console-card { border-color: var(--line); }
+.console-terminal { border-style: dashed !important; }
+.console-terminal.active { border-color: #1f7063 !important; box-shadow: 0 0 0 1px #1f7063 inset; }
+.gate-table td { vertical-align: top; }
+.snapshot-card { border-color: #b7dccf; }
+.snapshot-card.empty { border-style: dashed; }
+.backfill-card { border-color: #e6b5b3; background: #fdf8f6; }
+.hatch-limit-row { padding: 8px 0; border-top: 1px solid #edf1ef; }
+.row-resolved { opacity: .55; }
+.log-list { display: flex; flex-direction: column; gap: 7px; max-height: 260px; overflow: auto; }
+.log-row { display: flex; align-items: flex-start; gap: 7px; }
+.log-time { flex: 0 0 46px; color: #93a59e !important; }
+.nav-badge { margin-left: auto; background: #c26b2a; color: white; border-radius: 9px; font-size: 9px; font-style: normal; font-weight: 800; min-width: 17px; height: 17px; display: grid; place-items: center; padding: 0 5px; }
+.legacy-tag { display: inline-block; margin-left: 6px; background: #c26b2a; color: white; border-radius: 3px; font-size: 8px; font-style: normal; font-weight: 700; padding: 1px 4px; vertical-align: middle; }
+.warning-banner.locked { color: #1d5f51; background: #edf7f3; border-color: #b7dccf; }
+.print-meta { display: flex; flex-wrap: wrap; gap: 18px; margin: 12px 0 0; font-size: 10px; color: var(--muted); }
+.section-tag { font-style: normal; font-size: 9px; border-radius: 3px; padding: 2px 7px; margin-left: 8px; vertical-align: middle; }
+.section-tag.pass { background: #dcefe7; color: #1d5f51; }
+.section-tag.hold { background: #f7e2d4; color: #a3541e; }
+.print-checks td, .print-checks th { font-size: 11px; }
+.print-deck .load-missing { position: absolute; left: 5px; bottom: 5px; background: #b64440; color: white; border-radius: 3px; font-size: 8px; font-style: normal; padding: 2px 4px; }
+
 @media print {
   .app-header, .app-nav, .page-heading, .mantine-AppShell-navbar, .mantine-AppShell-header { display: none !important; }
   .page { padding: 0; max-width: none; }
